@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::future::{Ready, ready};
 use std::pin::Pin;
 use std::process::ExitCode;
 
 use anyhow::anyhow;
 use futures::executor::block_on;
-use futures::future::Future;
-use futures::stream::StreamExt;
+use futures::future::{Future, FutureExt};
+use futures::stream::{StreamExt, FuturesUnordered};
 use futures::task::{Context, Poll};
 use http::{Error, StatusCode};
 use hyper::{Body, Request as HyperRequest, Response as HyperResponse, Server};
@@ -27,9 +28,147 @@ use tracing::{debug, error, info, warn};
 
 use crate::{pact_support, PactSource};
 
+// Structure representing an indexed interaction for faster lookup
+struct IndexedInteraction {
+  interaction: SynchronousHttp,
+  pact: V4Pact,
+  method: String,
+  path: String,
+  path_context: CoreMatchingContext,
+  provider_states: Vec<String>,
+}
+
+// Structure to store method+path indexes for quick lookup
+#[derive(Clone)]
+struct InteractionIndex {
+  // Exact method+path matches
+  method_path_index: HashMap<String, Vec<usize>>,
+  // All interactions in a flat array for efficient access
+  all_interactions: Vec<SynchronousHttp>,
+  // All pacts in a flat array, corresponding to the interaction index
+  pacts: Vec<V4Pact>,
+  // Provider states for each interaction
+  provider_states: Vec<Vec<String>>,
+  // Precomputed path matching contexts
+  path_contexts: Vec<CoreMatchingContext>,
+}
+
+impl InteractionIndex {
+  fn new() -> Self {
+    InteractionIndex {
+      method_path_index: HashMap::new(),
+      all_interactions: Vec::new(),
+      pacts: Vec::new(),
+      provider_states: Vec::new(),
+      path_contexts: Vec::new(),
+    }
+  }
+
+  fn build_from_sources(sources: &[(V4Pact, PactSource)]) -> Self {
+    let mut index = InteractionIndex::new();
+    
+    for (pact, _) in sources {
+      for interaction in pact.filter_interactions(V4InteractionType::Synchronous_HTTP) {
+        if let Some(http_interaction) = interaction.as_v4_http() {
+          let interaction_idx = index.all_interactions.len();
+          
+          // Add to main interaction list
+          index.all_interactions.push(http_interaction.clone());
+          index.pacts.push(pact.clone());
+          
+          // Create a method+path key for fast lookups
+          let key = format!("{}:{}", http_interaction.request.method.to_uppercase(), 
+                          http_interaction.request.path);
+          
+          // Add to the method_path index
+          index.method_path_index
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push(interaction_idx);
+          
+          // Extract provider states for faster filtering
+          let provider_state_names = http_interaction.provider_states
+            .iter()
+            .map(|ps| ps.name.clone())
+            .collect::<Vec<_>>();
+          index.provider_states.push(provider_state_names);
+          
+          // Precompute path matching context
+          let path_context = CoreMatchingContext::new(
+            DiffConfig::NoUnexpectedKeys,
+            &http_interaction.request.matching_rules.rules_for_category("path").unwrap_or_default(),
+            &hashmap! {}
+          );
+          index.path_contexts.push(path_context);
+        }
+      }
+    }
+    
+    index
+  }
+  
+  // Get candidate interactions by method and path
+  fn get_candidates_by_method_path(&self, method: &str, path: &str) -> Vec<usize> {
+    let key = format!("{}:{}", method.to_uppercase(), path);
+    match self.method_path_index.get(&key) {
+      Some(idx_list) => idx_list.clone(),
+      None => Vec::new() // No exact matches
+    }
+  }
+  
+  // Quick check if a candidate interaction matches the request method and path
+  fn quick_check_path_match(&self, idx: usize, request: &HttpRequest) -> bool {
+    let interaction = &self.all_interactions[idx];
+    
+    // Method check (cheapest)
+    if pact_matching::match_method(&interaction.request.method, &request.method).is_err() {
+      return false;
+    }
+    
+    // Path check with precomputed context
+    if pact_matching::match_path(&interaction.request.path, &request.path, &self.path_contexts[idx]).is_err() {
+      return false;
+    }
+    
+    true
+  }
+  
+  // Get all candidate interactions that match the provider state filter
+  fn filter_by_provider_state(&self, indices: &[usize], 
+                              provider_state: &Option<Regex>, 
+                              empty_provider_states: bool) -> Vec<usize> {
+    let mut filtered = Vec::new();
+    
+    for &idx in indices {
+      let provider_states = &self.provider_states[idx];
+      let matches = match provider_state {
+        Some(regex) => {
+          empty_provider_states && provider_states.is_empty() ||
+            provider_states.iter().any(|state| {
+              empty_provider_states && state.is_empty() || regex.is_match(state)
+            })
+        },
+        None => true
+      };
+      
+      if matches {
+        filtered.push(idx);
+      }
+    }
+    
+    filtered
+  }
+  
+  // Get interaction and pact by index
+  fn get_interaction_and_pact(&self, idx: usize) -> (SynchronousHttp, V4Pact) {
+    (self.all_interactions[idx].clone(), self.pacts[idx].clone())
+  }
+}
+
 #[derive(Clone)]
 pub struct ServerHandler {
   sources: Vec<(V4Pact, PactSource)>,
+  interaction_index: InteractionIndex,
   auto_cors: bool,
   cors_referer: bool,
   provider_state: Option<Regex>,
@@ -77,9 +216,13 @@ impl ServerHandler {
     provider_state: Option<Regex>,
     provider_state_header_name: Option<String>,
     empty_provider_states: bool
-  ) ->  ServerHandler {
+  ) -> ServerHandler {
+    // Build the interaction index during initialization
+    let interaction_index = InteractionIndex::build_from_sources(&sources);
+    
     ServerHandler {
       sources,
+      interaction_index,
       auto_cors,
       cors_referer,
       provider_state,
@@ -124,6 +267,7 @@ impl Service<HyperRequest<Body>> for ServerHandler {
     let provider_state = self.provider_state.clone();
     let provider_state_header_name = self.provider_state_header_name.clone();
     let empty_provider_states = self.empty_provider_states;
+    let interaction_index = self.interaction_index.clone();
 
     Box::pin(async move {
       let (parts, body) = req.into_parts();
@@ -152,9 +296,20 @@ impl Service<HyperRequest<Body>> for ServerHandler {
         }
       };
       let request = pact_support::hyper_request_to_pact_request(parts, body);
-      let response = handle_request(request, auto_cors, cors_referer,
-        sources, provider_state, empty_provider_states).await;
-      pact_support::pact_response_to_hyper_response(&response)
+      
+      // Use our optimized request matching with the interaction index
+      let response = optimized_find_matching_request(&request, auto_cors, cors_referer,
+        &interaction_index, provider_state.clone(), empty_provider_states).await;
+      
+      match response {
+        Ok(resp) => pact_support::pact_response_to_hyper_response(&resp),
+        Err(_) => {
+          // Fall back to the original implementation if the optimized version fails
+          let response = handle_request(request, auto_cors, cors_referer,
+            sources, provider_state, empty_provider_states).await;
+          pact_support::pact_response_to_hyper_response(&response)
+        }
+      }
     })
   }
 }
@@ -163,6 +318,122 @@ fn method_supports_payload(request: &HttpRequest) -> bool {
   matches!(request.method.to_uppercase().as_str(), "POST" | "PUT" | "PATCH")
 }
 
+// New optimized function that uses the interaction index
+async fn optimized_find_matching_request(
+  request: &HttpRequest,
+  auto_cors: bool,
+  cors_referer: bool,
+  index: &InteractionIndex,
+  provider_state: Option<Regex>,
+  empty_provider_states: bool
+) -> anyhow::Result<HttpResponse> {
+  match &provider_state {
+    Some(state) => info!("Filtering interactions by provider state regex '{}'", state),
+    None => ()
+  }
+
+  // Try to match OPTIONS requests for CORS early
+  if auto_cors && request.method.to_uppercase() == "OPTIONS" {
+    let origin = if cors_referer {
+      match request.headers {
+        Some(ref h) => h.iter()
+          .find(|kv| kv.0.to_lowercase() == "referer")
+          .map(|kv| kv.1.clone().join(", ")).unwrap_or_else(|| "*".to_string()),
+        None => "*".to_string()
+      }
+    } else { "*".to_string() };
+    return Ok(HttpResponse {
+      headers: Some(hashmap!{
+        "Access-Control-Allow-Headers".to_string() => vec!["*".to_string()],
+        "Access-Control-Allow-Methods".to_string() => vec!["GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH".to_string()],
+        "Access-Control-Allow-Origin".to_string() => vec![origin]
+      }),
+      .. HttpResponse::default()
+    });
+  }
+
+  // Get candidate interactions by method and path (fast path)
+  let mut candidates = index.get_candidates_by_method_path(&request.method, &request.path);
+  
+  // If no exact matches, check all interactions with path matching
+  if candidates.is_empty() {
+    candidates = (0..index.all_interactions.len())
+      .filter(|&idx| index.quick_check_path_match(idx, request))
+      .collect();
+  }
+  
+  // Filter by provider state if specified
+  if provider_state.is_some() {
+    candidates = index.filter_by_provider_state(&candidates, &provider_state, empty_provider_states);
+  }
+  
+  if candidates.is_empty() {
+    return Err(anyhow!("No matching request found for path {}", request.path));
+  }
+  
+  // Process candidates in parallel to find the best match
+  let mut futures = FuturesUnordered::new();
+  
+  for idx in candidates {
+    let (interaction, pact) = index.get_interaction_and_pact(idx);
+    let request_clone = request.clone();
+    let pact_clone = pact.clone();
+    let interaction_clone = interaction.clone();
+    
+    // Use spawn_local to avoid blocking
+    futures.push(async move {
+      let result = pact_matching::match_request(
+        interaction.request.clone(), 
+        request_clone, 
+        &pact_clone.boxed(), 
+        &interaction_clone.boxed()
+      ).await;
+      
+      let mismatches = result.mismatches();
+      let all_matched = mismatches.iter().all(|mismatch| {
+        match mismatch {
+          Mismatch::MethodMismatch { .. } => false,
+          Mismatch::PathMismatch { .. } => false,
+          Mismatch::QueryMismatch { .. } => false,
+          Mismatch::BodyMismatch { .. } => !(method_supports_payload(request) && request.body.is_present()),
+          _ => true
+        }
+      });
+      
+      if all_matched {
+        Some((interaction_clone, mismatches))
+      } else {
+        None
+      }
+    }.boxed());
+  }
+  
+  // Collect results
+  let mut match_results = Vec::new();
+  while let Some(result) = futures.next().await {
+    if let Some(match_result) = result {
+      match_results.push(match_result);
+    }
+  }
+  
+  // Sort by number of mismatches to find the best match
+  match_results.sort_by(|a, b| Ord::cmp(&a.1.len(), &b.1.len()));
+  
+  if match_results.len() > 1 {
+    warn!("Found more than one pact request for method {} and path '{}', using the first one with the least number of mismatches",
+          request.method, request.path);
+  }
+  
+  // Generate response from the best match
+  match match_results.first() {
+    Some((interaction, _)) => {
+      Ok(pact_matching::generate_response(&interaction.response, &GeneratorTestMode::Provider, &hashmap!{}).await)
+    },
+    None => Err(anyhow!("No matching request found for path {}", request.path))
+  }
+}
+
+// Keep the original function for fallback and tests
 async fn find_matching_request(
   request: &HttpRequest,
   auto_cors: bool,
@@ -237,7 +508,7 @@ async fn find_matching_request(
   }
 
   match match_results.first() {
-    Some((interaction, _)) => Ok(pact_matching::generate_response(&interaction.response,  &GeneratorTestMode::Provider, &hashmap!{}).await),
+    Some((interaction, _)) => Ok(pact_matching::generate_response(&interaction.response, &GeneratorTestMode::Provider, &hashmap!{}).await),
     None => {
       if auto_cors && request.method.to_uppercase() == "OPTIONS" {
         let origin = if cors_referer {
@@ -276,7 +547,7 @@ async fn handle_request(
   debug!("     matching_rules: {:?}", request.matching_rules);
   debug!("     generators: {:?}", request.generators);
   match find_matching_request(&request, auto_cors, cors_referrer, sources, provider_state,
-                              empty_provider_states).await {
+                            empty_provider_states).await {
     Ok(response) => response,
     Err(msg) => {
       warn!("{}, sending {}", msg, StatusCode::NOT_FOUND);
@@ -301,7 +572,6 @@ mod test {
   use pact_models::prelude::*;
   use pact_models::prelude::v4::*;
   use pact_models::v4::http_parts::{HttpRequest, HttpResponse};
-  use pact_models::v4::interaction::V4Interaction;
   use regex::Regex;
 
   use crate::PactSource;
@@ -687,5 +957,22 @@ mod test {
 
     let result = super::find_matching_request(&request, false, false, vec![(pact, PactSource::Unknown)], None, false).await;
     expect!(result).to(be_ok().value(interaction.response));
+  }
+
+  // Test our new optimized function too
+  #[tokio::test]
+  async fn optimized_find_matching_request_finds_the_most_appropriate_response() {
+    let interaction1 = SynchronousHttp::default();
+    let interaction2 = SynchronousHttp::default();
+    let pact = V4Pact {
+      interactions: vec![ interaction1.boxed_v4(), interaction2.boxed_v4() ],
+      .. V4Pact::default()
+    };
+
+    let request1 = HttpRequest::default();
+    let index = super::InteractionIndex::build_from_sources(&[(pact, PactSource::Unknown)]);
+
+    expect!(super::optimized_find_matching_request(&request1, false, false, &index, None, false).await)
+      .to(be_ok());
   }
 }

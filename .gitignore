@@ -9,3 +9,5 @@ release_artifacts
 
 /.idea/
 *.iml
+
+**/.claude/settings.local.json
