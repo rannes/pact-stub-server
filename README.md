@@ -196,3 +196,5 @@ Docker images are published to multiple registries
 _Note:_ From v0.6.0, Linux executables are statically built with `musl` and as designed to work against `glibc` (eg, Debian) and `musl` (eg, Alpine) based distos.
 
 </details>
+
+
